@@ -179,12 +179,11 @@ class AccountManager:
             return None
         if mode == RotationMode.RANDOM:
             return random.choice(accounts)
-        if mode == RotationMode.ROUND_ROBIN:
-            self._rr %= len(accounts)
-            acc = accounts[self._rr]
-            self._rr += 1
-            return acc
-        return None
+        # Default to ROUND_ROBIN for SEQUENTIAL as well in the one-by-one loop
+        self._rr %= len(accounts)
+        acc = accounts[self._rr]
+        self._rr += 1
+        return acc
 
     async def health_check(self) -> dict:
         accounts = await self.active_list()
@@ -319,6 +318,7 @@ class Engine:
 
         self.running    = True
         self.live_stats = {"sent": 0, "failed": 0, "started": datetime.utcnow()}
+        clients = {}
 
         try:
             targets    = await self.db.get("targets", [])
@@ -340,17 +340,57 @@ class Engine:
 
             log.info(f"Broadcast | Accounts:{len(accounts)} Targets:{len(targets)}")
 
-            if mode == RotationMode.SEQUENTIAL:
-                tasks = [
-                    self._from_account(acc, targets, template, min_d, max_d)
-                    for acc in accounts
-                ]
-                await asyncio.gather(*tasks)
-            else:
-                for target in targets:
-                    acc = await self.am.pick(accounts, mode)
-                    if acc:
-                        await self._one_shot(acc, target, template, min_d, max_d)
+            # Pre-start all clients
+            for acc in accounts:
+                client = self.am.make_client(acc, "_brd")
+                try:
+                    await client.start()
+                    clients[str(acc["_id"])] = client
+                except (AuthKeyUnregistered, SessionExpired, UserDeactivated, UserDeactivatedBan, PhoneNumberBanned) as e:
+                    log.error(f"[{acc.get('label')}] Dead session on start: {e}")
+                    await self.am.mark_banned(acc["_id"])
+                except Exception as e:
+                    log.error(f"Failed to start client for {acc.get('label')}: {e}")
+
+            if not clients:
+                log.error("No clients started — aborting.")
+                return
+
+            # Main one-by-one loop
+            for target in targets:
+                # Re-pick only from accounts whose clients successfully started
+                available_accs = [a for a in accounts if str(a["_id"]) in clients]
+                if not available_accs:
+                    log.error("All accounts became unavailable.")
+                    break
+
+                acc = await self.am.pick(available_accs, mode)
+                if not acc: break
+
+                client = clients.get(str(acc["_id"]))
+                try:
+                    res = await self.smart_send(client, target, template)
+                    if res["ok"]:
+                        self.live_stats["sent"] += 1
+                        await self.db.acc_stats(acc["_id"], sent=1)
+                    else:
+                        self.live_stats["failed"] += 1
+                        await self.db.acc_stats(acc["_id"], failed=1)
+                        if res.get("permanent"):
+                            log.warning(f"Perm error -> {target}: {res['error']}")
+                except (AuthKeyUnregistered, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
+                    log.error(f"[{acc.get('label')}] Session died during broadcast: {e}")
+                    await self.am.mark_banned(acc["_id"])
+                    try: await client.stop()
+                    except: pass
+                    clients.pop(str(acc["_id"]), None)
+                    continue
+                except Exception as e:
+                    log.error(f"Error sending from {acc.get('label')}: {e}")
+                    self.live_stats["failed"] += 1
+                    await self.db.acc_stats(acc["_id"], failed=1)
+
+                await asyncio.sleep(random.uniform(min_d, max_d))
 
             dur = (datetime.utcnow() - self.live_stats["started"]).seconds
             summary = (
@@ -371,47 +411,10 @@ class Engine:
         except Exception as e:
             log.error(f"Broadcast crashed: {e}")
         finally:
+            for c in clients.values():
+                try: await c.stop()
+                except: pass
             self.running = False
-
-    async def _from_account(self, acc: dict, targets: list,
-                             tmpl: dict, min_d, max_d):
-        ub = self.am.make_client(acc, "_seq")
-        sent = failed = 0
-        try:
-            await ub.start()
-            log.info(f"[{acc['label']}] Sending to {len(targets)} targets")
-            for target in targets:
-                res = await self.smart_send(ub, target, tmpl)
-                if res["ok"]:
-                    sent += 1; self.live_stats["sent"] += 1
-                else:
-                    failed += 1; self.live_stats["failed"] += 1
-                    if res.get("permanent"):
-                        log.warning(f"Perm error -> {target}: {res['error']}")
-                await asyncio.sleep(random.uniform(min_d, max_d))
-        except (AuthKeyUnregistered, SessionExpired, UserDeactivated, UserDeactivatedBan) as e:
-            log.error(f"[{acc['label']}] Dead session: {e}")
-            await self.am.mark_banned(acc["_id"])
-        except Exception as e:
-            log.error(f"[{acc['label']}] Error: {e}")
-        finally:
-            try: await ub.stop()
-            except: pass
-            await self.db.acc_stats(acc["_id"], sent, failed)
-
-    async def _one_shot(self, acc: dict, target, tmpl: dict, min_d, max_d):
-        ub = self.am.make_client(acc, "_rr")
-        try:
-            await ub.start()
-            res = await self.smart_send(ub, target, tmpl)
-            if res["ok"]: self.live_stats["sent"] += 1
-            else:         self.live_stats["failed"] += 1
-            await asyncio.sleep(random.uniform(min_d, max_d))
-        except Exception as e:
-            log.error(f"one_shot error: {e}")
-        finally:
-            try: await ub.stop()
-            except: pass
 
 # ════════════════════════════════════════════════════════════════
 #  INIT
@@ -429,7 +432,7 @@ scheduler = AsyncIOScheduler()
 def admin_only(fn):
     async def wrapper(client, message: Message):
         if message.from_user.id not in ADMIN_IDS:
-            return await message.reply_text(f"**{sc('Unauthorized')}**")
+            return
         return await fn(client, message)
     wrapper.__name__ = fn.__name__
     return wrapper
@@ -437,7 +440,7 @@ def admin_only(fn):
 def cb_admin(fn):
     async def wrapper(client, cb: CallbackQuery):
         if cb.from_user.id not in ADMIN_IDS:
-            return await cb.answer(sc("Unauthorized"), show_alert=True)
+            return
         return await fn(client, cb)
     wrapper.__name__ = fn.__name__
     return wrapper
@@ -1104,7 +1107,7 @@ async def cb_menu(client: Client, cb: CallbackQuery):
             f"`{sc('active')} ` `{len(accounts)}`\n"
             f"`{sc('banned')} ` `{banned}`\n"
             f"`{sc('total')}  ` `{total}`\n\n"
-            f"**{sc('Top Active')}**\n{preview or f'`{sc(\"none\")}`'}\n\n"
+            f"**{sc('Top Active')}**\n{preview or sc('none')}\n\n"
             f"`/add_account` · `/list_accounts`",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(sc("Health Check"), callback_data="healthcheck")],
@@ -1125,7 +1128,7 @@ async def cb_menu(client: Client, cb: CallbackQuery):
         await cb.edit_message_text(
             f"**{sc('Templates')}** `[{total}]`\n"
             f"{'─' * 22}\n\n"
-            f"{breakdown or f'`{sc(\"none\")}`'}\n\n"
+            f"{breakdown or sc('none')}\n\n"
             f"`/add_template <text>`\n"
             f"`/list_templates`\n"
             f"`/del_template <n>`\n\n"
@@ -1141,7 +1144,7 @@ async def cb_menu(client: Client, cb: CallbackQuery):
         await cb.edit_message_text(
             f"**{sc('Targets')}** `[{len(targets)}]`\n"
             f"{'─' * 22}\n\n"
-            f"{preview or f'`{sc(\"none\")}`'}{extra}\n\n"
+            f"{preview or sc('none')}{extra}\n\n"
             f"`{sc('blacklisted')}` `{blacklisted}`\n\n"
             f"`/set_targets` · `/add_target` · `/clear_targets`\n"
             f"`/blacklist` · `/export_targets`",
@@ -1412,6 +1415,14 @@ async def cb_export(client: Client, cb: CallbackQuery):
 #  MAIN RUNNER
 # ════════════════════════════════════════════════════════════════
 async def main():
+    # Test MongoDB connection
+    try:
+        await db.cfg.find_one({})
+        log.info("Connected to MongoDB")
+    except Exception as e:
+        log.critical(f"Could not connect to MongoDB: {e}")
+        return
+
     scheduler.start()
     await bot.start()
 
