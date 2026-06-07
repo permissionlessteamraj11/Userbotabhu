@@ -7,7 +7,9 @@
 """
 
 import asyncio
+import os
 import random
+from dotenv import load_dotenv
 import csv
 import io
 import logging
@@ -31,13 +33,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from motor.motor_asyncio import AsyncIOMotorClient
 
+load_dotenv()
+
 # ════════════════════════════════════════════════════════════════
 #  CONFIG
 # ════════════════════════════════════════════════════════════════
-BOT_TOKEN   = "8996403565:AAHsR8DiDZKWRk0jMKudDfozp0B6VTULRC0"
-API_ID      = 37729457
-API_HASH    = "bb68973b7efcbbd074cda984c95502d6"
-MONGO_URL   = "mongodb://localhost:27017"
+BOT_TOKEN   = os.getenv("BOT_TOKEN")
+API_ID      = int(os.getenv("API_ID") or 0)
+API_HASH    = os.getenv("API_HASH")
+MONGO_URL   = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 OWNER_ID    = 7670992701
 ADMIN_IDS   = [OWNER_ID]
 LOG_CHANNEL = -1003993752133  # set to channel ID to enable
