@@ -1,6 +1,4 @@
 APScheduler
-dnspython
-motor
 pyrogram
 tgcrypto
 python-dotenv
