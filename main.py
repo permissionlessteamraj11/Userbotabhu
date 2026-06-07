@@ -31,7 +31,7 @@ from pyrogram.errors import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from motor.motor_asyncio import AsyncIOMotorClient
+from database import JSONDatabase
 
 load_dotenv()
 
@@ -41,7 +41,7 @@ load_dotenv()
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 API_ID      = int(os.getenv("API_ID") or 0)
 API_HASH    = os.getenv("API_HASH")
-MONGO_URL   = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+DATA_DIR    = "data"
 OWNER_ID    = 7670992701
 ADMIN_IDS   = [OWNER_ID]
 LOG_CHANNEL = -1003993752133  # set to channel ID to enable
@@ -77,15 +77,14 @@ log = logging.getLogger(__name__)
 #  DATABASE MANAGER
 # ════════════════════════════════════════════════════════════════
 class DB:
-    def __init__(self, url: str):
-        client      = AsyncIOMotorClient(url)
-        d           = client["telegram_automator"]
-        self.acc    = d["accounts"]
-        self.cfg    = d["settings"]
-        self.tmpl   = d["templates"]
-        self.stats  = d["stats"]
-        self.bl     = d["blacklist"]
-        self.logs   = d["logs"]
+    def __init__(self, data_dir: str):
+        client      = JSONDatabase(data_dir)
+        self.acc    = client["accounts"]
+        self.cfg    = client["settings"]
+        self.tmpl   = client["templates"]
+        self.stats  = client["stats"]
+        self.bl     = client["blacklist"]
+        self.logs   = client["logs"]
 
     async def get(self, key: str, default=None):
         doc = await self.cfg.find_one({"key": key})
@@ -425,7 +424,7 @@ class Engine:
 # ════════════════════════════════════════════════════════════════
 bot       = Client("Automator_v3", api_id=API_ID, api_hash=API_HASH,
                    bot_token=BOT_TOKEN)
-db        = DB(MONGO_URL)
+db        = DB(DATA_DIR)
 am        = AccountManager(db)
 engine    = Engine(db, am, bot)
 scheduler = AsyncIOScheduler()
@@ -1419,12 +1418,17 @@ async def cb_export(client: Client, cb: CallbackQuery):
 #  MAIN RUNNER
 # ════════════════════════════════════════════════════════════════
 async def main():
-    # Test MongoDB connection
+    # Initialize Data Directory
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+        log.info(f"Created data directory: {DATA_DIR}")
+
+    # Test Database connection (ensures files are accessible)
     try:
         await db.cfg.find_one({})
-        log.info("Connected to MongoDB")
+        log.info("JSON Database initialized")
     except Exception as e:
-        log.critical(f"Could not connect to MongoDB: {e}")
+        log.critical(f"Could not initialize JSON Database: {e}")
         return
 
     scheduler.start()
