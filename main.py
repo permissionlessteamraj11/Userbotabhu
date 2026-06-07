@@ -860,64 +860,46 @@ async def cmd_blacklist(client: Client, message: Message):
 
 # ─── SCHEDULER COMMANDS ────────────────────────────────────────
 
-@bot.on_message(filters.command("start_job") & filters.private)
+@bot.on_message(filters.command(["start_job", "schedule"]) & filters.private)
 @admin_only
 async def cmd_start_job(client: Client, message: Message):
     """
-    /start_job interval 15          -> every 15 minutes
-    /start_job cron 0 9 * * *       -> daily at 9:00 UTC
-    /start_job cron 30 8,20 * * 1-5 -> weekdays 8:30 & 20:30
+    /schedule 2    -> every 2 hours
+    /schedule 0.5  -> every 30 minutes
     """
     try:
-        parts = message.text.split()
-        jtype = parts[1].lower()
+        raw   = message.text.split()
+        if len(raw) < 2:
+            raise ValueError("missing interval")
+
+        hours = float(raw[1])
+        if hours <= 0:
+            raise ValueError("interval must be positive")
 
         if scheduler.get_job("broadcast_job"):
             scheduler.remove_job("broadcast_job")
 
-        if jtype == "interval":
-            mins = int(parts[2])
-            scheduler.add_job(
-                engine.broadcast, "interval",
-                minutes=mins, id="broadcast_job",
-                next_run_time=datetime.utcnow()
-            )
-            await message.reply_text(
-                f"**{sc('Interval Job Active')}**\n"
-                f"{'─' * 22}\n\n"
-                f"`{sc('interval')} ` `{mins} {sc('minutes')}`\n"
-                f"`{sc('first run')}` `{sc('now')}`",
-                reply_markup=back_home()
-            )
+        scheduler.add_job(
+            engine.broadcast, "interval",
+            hours=hours, id="broadcast_job",
+            next_run_time=datetime.utcnow()
+        )
+        await db.set("sched_hours", hours)
 
-        elif jtype == "cron":
-            expr   = " ".join(parts[2:])
-            cparts = expr.split()
-            if len(cparts) != 5:
-                raise ValueError("Need exactly 5 cron parts")
-            trigger = CronTrigger(
-                minute=cparts[0], hour=cparts[1],
-                day=cparts[2], month=cparts[3], day_of_week=cparts[4]
-            )
-            scheduler.add_job(engine.broadcast, trigger, id="broadcast_job")
-            job = scheduler.get_job("broadcast_job")
-            await message.reply_text(
-                f"**{sc('Cron Job Active')}**\n"
-                f"{'─' * 22}\n\n"
-                f"`{sc('expression')}` `{expr}`\n"
-                f"`{sc('next run')}  ` `{job.next_run_time:%Y-%m-%d %H:%M UTC}`",
-                reply_markup=back_home()
-            )
-        else:
-            raise ValueError(f"unknown type: {jtype}")
+        await message.reply_text(
+            f"**{sc('Broadcast Scheduled')}**\n"
+            f"{'─' * 22}\n\n"
+            f"`{sc('frequency')} ` `{hours} {sc('hours')}`\n"
+            f"`{sc('next run')}  ` `{sc('now')}`",
+            reply_markup=back_home()
+        )
 
-    except Exception as e:
+    except (IndexError, ValueError):
         await message.reply_text(
             f"**{sc('Usage')}**\n\n"
-            f"`/start_job interval 15`\n"
-            f"`/start_job cron 0 9 * * *`\n"
-            f"`/start_job cron */30 * * * *`\n\n"
-            f"`{sc('error')}` `{e}`"
+            f"`/schedule <hours>`\n"
+            f"`/schedule 2` — {sc('every 2 hours')}\n"
+            f"`/schedule 0.5` — {sc('every 30 minutes')}"
         )
 
 
@@ -926,6 +908,7 @@ async def cmd_start_job(client: Client, message: Message):
 async def cmd_stop_job(client: Client, message: Message):
     if scheduler.get_job("broadcast_job"):
         scheduler.remove_job("broadcast_job")
+        await db.set("sched_hours", None)
         await message.reply_text(
             f"**{sc('Job Stopped')}**\n`{sc('scheduler is now off')}`",
             reply_markup=back_home()
@@ -1176,25 +1159,35 @@ async def cb_menu(client: Client, cb: CallbackQuery):
 
     elif page == "scheduler":
         job = scheduler.get_job("broadcast_job")
-        if job:
-            info = (f"`{sc('status')}  ` `ᴀᴄᴛɪᴠᴇ`\n"
-                    f"`{sc('next')}    ` `{job.next_run_time:%Y-%m-%d %H:%M UTC}`\n"
-                    f"`{sc('trigger')} ` `{job.trigger}`")
+        h   = await db.get("sched_hours")
+        if job and h:
+            info = (f"`{sc('status')}    ` `ᴀᴄᴛɪᴠᴇ`\n"
+                    f"`{sc('frequency')} ` `{h} {sc('hours')}`\n"
+                    f"`{sc('next run')}  ` `{job.next_run_time:%H:%M UTC}`")
         else:
             info = f"`{sc('status')}  ` `ᴏꜰꜰ`\n`{sc('no active job')}`"
+
         await cb.edit_message_text(
             f"**{sc('Scheduler')}**\n"
             f"{'─' * 22}\n\n"
             f"{info}\n\n"
-            f"`/start_job interval 15`\n"
-            f"`/start_job cron 0 9 * * *`\n"
-            f"`/stop_job`",
+            f"_{sc('select frequency to start')}_",
             reply_markup=InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton(sc("Stop Job"), callback_data="job:stop"),
-                    InlineKeyboardButton(sc("Run Now"), callback_data="runnow"),
+                    InlineKeyboardButton(sc("1h"),  callback_data="schedset:1"),
+                    InlineKeyboardButton(sc("2h"),  callback_data="schedset:2"),
+                    InlineKeyboardButton(sc("3h"),  callback_data="schedset:3"),
+                    InlineKeyboardButton(sc("6h"),  callback_data="schedset:6"),
                 ],
-                [InlineKeyboardButton(sc("Back"), callback_data="m:home")],
+                [
+                    InlineKeyboardButton(sc("12h"), callback_data="schedset:12"),
+                    InlineKeyboardButton(sc("24h"), callback_data="schedset:24"),
+                    InlineKeyboardButton(sc("Stop"), callback_data="job:stop"),
+                ],
+                [
+                    InlineKeyboardButton(sc("Run Now"), callback_data="runnow"),
+                    InlineKeyboardButton(sc("Back"),    callback_data="m:home"),
+                ]
             ])
         )
 
@@ -1319,6 +1312,7 @@ async def cb_job_action(client: Client, cb: CallbackQuery):
     if action == "stop":
         if scheduler.get_job("broadcast_job"):
             scheduler.remove_job("broadcast_job")
+            await db.set("sched_hours", None)
             await cb.answer(sc("job stopped"), show_alert=True)
         else:
             await cb.answer(sc("no active job"), show_alert=True)
@@ -1326,6 +1320,52 @@ async def cb_job_action(client: Client, cb: CallbackQuery):
             f"**{sc('Scheduler')}**\n`{sc('status')}` `ᴏꜰꜰ`",
             reply_markup=back_home()
         )
+
+
+@bot.on_callback_query(filters.regex(r"^schedset:"))
+@cb_admin
+async def cb_sched_set(client: Client, cb: CallbackQuery):
+    hours = float(cb.data.split(":")[1])
+    if scheduler.get_job("broadcast_job"):
+        scheduler.remove_job("broadcast_job")
+
+    scheduler.add_job(
+        engine.broadcast, "interval",
+        hours=hours, id="broadcast_job",
+        next_run_time=datetime.utcnow()
+    )
+    await db.set("sched_hours", hours)
+    await cb.answer(f"{sc('scheduled every')} {hours}{sc('h')}", show_alert=False)
+
+    # Refresh the scheduler page
+    job = scheduler.get_job("broadcast_job")
+    info = (f"`{sc('status')}    ` `ᴀᴄᴛɪᴠᴇ`\n"
+            f"`{sc('frequency')} ` `{hours} {sc('hours')}`\n"
+            f"`{sc('next run')}  ` `{job.next_run_time:%H:%M UTC}`")
+
+    await cb.edit_message_text(
+        f"**{sc('Scheduler')}**\n"
+        f"{'─' * 22}\n\n"
+        f"{info}\n\n"
+        f"_{sc('select frequency to start')}_",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(sc("1h"),  callback_data="schedset:1"),
+                InlineKeyboardButton(sc("2h"),  callback_data="schedset:2"),
+                InlineKeyboardButton(sc("3h"),  callback_data="schedset:3"),
+                InlineKeyboardButton(sc("6h"),  callback_data="schedset:6"),
+            ],
+            [
+                InlineKeyboardButton(sc("12h"), callback_data="schedset:12"),
+                InlineKeyboardButton(sc("24h"), callback_data="schedset:24"),
+                InlineKeyboardButton(sc("Stop"), callback_data="job:stop"),
+            ],
+            [
+                InlineKeyboardButton(sc("Run Now"), callback_data="runnow"),
+                InlineKeyboardButton(sc("Back"),    callback_data="m:home"),
+            ]
+        ])
+    )
 
 
 # ─── HEALTH CHECK ──────────────────────────────────────────────
@@ -1432,6 +1472,20 @@ async def main():
         return
 
     scheduler.start()
+
+    # Restore Persistence Schedule
+    sched_hours = await db.get("sched_hours")
+    if sched_hours:
+        try:
+            scheduler.add_job(
+                engine.broadcast, "interval",
+                hours=float(sched_hours), id="broadcast_job",
+                next_run_time=datetime.utcnow()
+            )
+            log.info(f"Restored broadcast job: every {sched_hours} hours")
+        except Exception as e:
+            log.error(f"Failed to restore broadcast job: {e}")
+
     await bot.start()
 
     log.info("Advanced Multi-Account Automator v3.0 — Online")
